@@ -1,0 +1,15 @@
+{
+  "name": "discharge-summary-agent",
+  "version": "1.0.0",
+  "description": "Agentic AI take-home solution for discharge summary drafting",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "run:demo": "node src/index.js --input ./sample-data --output ./runs/demo",
+    "learn": "node src/learn_cli.js --drafts ./runs/demo --out ./runs/demo/learning_report.json"
+  },
+  "dependencies": {
+    "pdf-parse": "^1.1.1"
+  }
+}
