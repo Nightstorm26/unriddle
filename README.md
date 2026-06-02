@@ -1,4 +1,4 @@
-# Discharge Summary Agent (Take-Home Build)
+# Discharge Summary Agent
 
 This project implements an **agentic discharge-summary drafting system** for synthetic patient PDFs.
 It is designed for clinician review workflows and enforces a strict **no-fabrication** policy.
