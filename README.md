@@ -65,6 +65,17 @@ patients/
     ...
 ```
 
+Recommended (workspace-local) setup:
+
+```text
+input/
+  patient_sources/
+    patient_001.pdf
+    patient_002.pdf
+```
+
+Keep your source PDFs inside this workspace so runs are reproducible and portable.
+
 The runner also supports:
 
 - A **single PDF file** (one patient)
@@ -83,6 +94,18 @@ npm install
 
 ```bash
 npm start -- --input ./patients --output ./runs/latest --maxSteps 20
+```
+
+Workspace-local single file:
+
+```bash
+npm start -- --input "./input/patient_sources/patient_001.pdf" --output ./runs/latest --maxSteps 20
+```
+
+Workspace-local folder of PDFs:
+
+```bash
+npm start -- --input "./input/patient_sources" --output ./runs/latest --maxSteps 20
 ```
 
 Single-file mode example (Windows path with spaces):
