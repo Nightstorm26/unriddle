@@ -1,8 +1,8 @@
 # Discharge Summary Agent
 
-Agentic AI system that ingests synthetic patient source-note PDFs and produces **structured discharge-summary drafts for clinician review**. Built for a take-home assignment with a strict **no-fabrication** policy.
+Agentic AI system that ingests synthetic patient source-note PDFs and produces **structured discharge-summary drafts for clinician review**.
 
-**Docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [SUBMISSION.md](./SUBMISSION.md)
+**Docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) 
 
 ---
 
@@ -154,4 +154,4 @@ input/patient_sources/
 
 ## License / data
 
-Synthetic patient data only. Do not commit real PHI. API keys are not required for the current implementation.
+Synthetic patient data only. Do not commit real PHI. API keys are not required for the current implementation. Strict **no-fabrication** policy.
