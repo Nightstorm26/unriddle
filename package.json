@@ -10,6 +10,8 @@
     "learn": "node src/learn_cli.js --drafts ./runs/demo --out ./runs/demo/learning_report.json"
   },
   "dependencies": {
-    "pdf-parse": "^1.1.1"
+    "sharp": "^0.34.5",
+    "tesseract.js": "^7.0.0",
+    "unpdf": "^1.6.2"
   }
 }

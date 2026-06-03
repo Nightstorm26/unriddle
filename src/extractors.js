@@ -22,34 +22,43 @@ function gatherSection(text, heading) {
 
 function extractDemographics(text) {
   return {
-    patient_name: firstMatch(text, /(?:Patient Name|Name)\s*[:\-]\s*([^\n]+)/i),
-    mrn: firstMatch(text, /\b(?:MRN|Medical Record Number)\s*[:\-]\s*([^\n]+)/i),
-    dob: firstMatch(text, /\b(?:DOB|Date of Birth)\s*[:\-]\s*([^\n]+)/i),
-    sex: firstMatch(text, /\b(?:Sex|Gender)\s*[:\-]\s*([^\n]+)/i)
+    patient_name:
+      firstMatch(text, /Patient Name\s+([A-Z][a-z]+(?:\s+[A-Z][a-z.]+){0,2})/i) ||
+      firstMatch(text, /(?:Patient Name|Name)\s*[:\|\-]\s*([^\n|]+)/i),
+    mrn:
+      firstMatch(text, /\b(?:MRN|Medical Record Number|PR Number|IP Number)\s*[:\|\-]?\s*([^\n|]+)/i),
+    dob: firstMatch(text, /\b(?:DOB|Date of Birth|Age\/Sex|AgelSex)\s*[:\|\-]\s*([^\n|]+)/i),
+    sex: firstMatch(text, /\b(?:Sex|Gender|Age\/Sex|AgelSex)\s*[:\|\-]\s*([^\n|]+)/i)
   };
 }
 
 function extractDates(text) {
   return {
-    admission_date: firstMatch(text, /Admission Date\s*[:\-]\s*([^\n]+)/i),
-    discharge_date: firstMatch(text, /Discharge Date\s*[:\-]\s*([^\n]+)/i)
+    admission_date: firstMatch(text, /Admission Date\s*[:\|\-]?\s*([0-9]{1,2}[\/\-][0-9]{1,2}[\/\-][0-9]{2,4}[^|\n]*)/i),
+    discharge_date: firstMatch(text, /Discharge Date\s*[:\|\-]?\s*([0-9]{1,2}[\/\-][0-9]{1,2}[\/\-][0-9]{2,4}[^|\n]*)/i)
   };
 }
 
 function extractDiagnoses(text) {
   const principal = allMatches(
     text,
-    /(?:Principal Diagnosis|Primary Diagnosis|Final Diagnosis|Discharge Diagnosis)\s*[:\-]\s*([^\n]+)/gi
+    /(?:Principal Diagnosis|Primary Diagnosis|Final Diagnosis|Discharge Diagnosis)\s*[:\-\|]\s*([^\n]+)/gi
   );
   if (!principal.length) {
-    const fallback = firstMatch(text, /(?:Diagnosis|Diagnoses)\s*[:\-]\s*([^\n]+)/i);
+    const numbered = allMatches(text, /\d+\)\s*([A-Z][A-Z\s]{4,60})/g);
+    if (numbered.length) principal.push(...numbered.slice(0, 3));
+  }
+  if (!principal.length) {
+    const fallback = firstMatch(text, /(?:Diagnosis|Diagnoses)\s*[:\-\|]\s*([^\n]+)/i);
     if (fallback) principal.push(fallback);
   }
   const secondary = allMatches(
     text,
-    /(?:Secondary Diagnos(?:is|es)|Other Diagnos(?:is|es)|Comorbidit(?:y|ies))\s*[:\-]\s*([^\n]+)/gi
+    /(?:Secondary Diagnos(?:is|es)|Other Diagnos(?:is|es)|Comorbidit(?:y|ies))\s*[:\-\|]\s*([^\n]+)/gi
   );
-  return { principal, secondary };
+  const cleanDx = (items) =>
+    items.filter((item) => item && item.length > 3 && !/^(ip no|mrn|patient name)$/i.test(item.trim()));
+  return { principal: cleanDx(principal), secondary: cleanDx(secondary) };
 }
 
 function extractProcedures(text) {
@@ -81,6 +90,8 @@ function extractMedicationSections(text) {
   const dischargeBlock =
     gatherSection(text, "Discharge Medications") ||
     gatherSection(text, "Medications on Discharge") ||
+    gatherSection(text, "Discharge Medication") ||
+    gatherSection(text, "Drugs on Discharge") ||
     gatherSection(text, "Discharge Rx") ||
     gatherSection(text, "Medications");
 
@@ -91,7 +102,13 @@ function extractMedicationSections(text) {
 }
 
 function extractHospitalCourse(text) {
-  return gatherSection(text, "Hospital Course");
+  return (
+    gatherSection(text, "Hospital Course") ||
+    gatherSection(text, "Course in Hospital") ||
+    gatherSection(text, "Course in the Ward") ||
+    gatherSection(text, "Treatment Given") ||
+    gatherSection(text, "Brief Hospital Course")
+  );
 }
 
 function extractFollowUp(text) {

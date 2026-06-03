@@ -8,6 +8,7 @@ It is designed for clinician review workflows and enforces a strict **no-fabrica
 ### Part 1 (required): completed
 
 - Real iterative agent loop with planning + re-planning (`runDischargeSummaryAgent` in `src/agent.js`)
+- **RAG evidence retrieval** over ingested source notes only (`src/retrieval.js`, `src/ragExtract.js`)
 - PDF ingestion from patient folders (`src/pdf.js`)
 - Structured discharge-summary draft output with required sections
 - No fabrication guardrail:
@@ -44,6 +45,8 @@ It is designed for clinician review workflows and enforces a strict **no-fabrica
 
 - `src/index.js` - CLI runner for Part 1 batch execution
 - `src/agent.js` - core agent loop and planning/actions
+- `src/retrieval.js` - chunking + lexical retrieval index (case PDFs only)
+- `src/ragExtract.js` - evidence-backed field extraction from retrieved chunks
 - `src/pdf.js` - PDF listing and extraction with timeout handling
 - `src/extractors.js` - section extraction helpers
 - `src/tools.js` - mock tools + retry wrapper + med reconciliation
@@ -141,8 +144,49 @@ Optional Part 2:
 - Missing, pending, and conflicting facts are always escalated/flagged.
 - Drug interaction and escalation tools are mocked and can be replaced with production integrations.
 
+## PDF ingestion (text + scanned)
+
+The project uses a **two-stage strategy**:
+
+1. **Fast text-layer extraction** with `unpdf` (PDF.js-based).
+2. **OCR fallback** for scanned/image PDFs when extracted text is too sparse:
+   - `unpdf` `extractImages` pulls embedded page images
+   - `sharp` converts raw pixels to PNG
+   - `tesseract.js` performs OCR per page
+
+### Why not `pdf-text-extract`?
+
+`pdf-text-extract` wraps Poppler `pdftotext` and is strong for searchable PDFs on Linux servers, but:
+
+- it still does **not OCR scanned pages** by itself
+- it requires external Poppler binaries (extra setup on Windows/serverless)
+- your current patient PDF is image-based, so OCR fallback is required anyway
+
+For this assignment and Windows-local workflow, **`unpdf + OCR fallback` is the better fit**.
+
+Run locally:
+
+```bash
+npm start -- --input "./input/patient_sources/patient 2 (1).pdf" --output ./runs/latest --maxSteps 20
+```
+
+Note: OCR can take several minutes for multi-page scans.
+
+## RAG workflow (agentic evidence grounding)
+
+After PDF ingest, the agent:
+
+1. Chunks each patient's source text (page-aware, overlap windows)
+2. Builds a local lexical retrieval index (no external medical knowledge)
+3. For each discharge field, retrieves top evidence chunks via field-specific queries
+4. Extracts values only from retrieved context (+ full-document fallback if no evidence)
+5. Attaches `evidence` snippets to known fields in `discharge_summary_draft.json`
+6. Flags conflicts when retrieved evidence disagrees
+
+Safety rule preserved: if evidence is insufficient, field remains `missing` (never guessed).
+
 ## Limits and next improvements
 
-- Extraction uses regex heuristics and can be improved with section classifiers or OCR pipelines.
+- Extraction uses regex heuristics and can be improved with section classifiers on top of OCR text.
 - Conflict detection currently targets common high-risk conflicts; can be expanded.
 - Part 2 uses simulated edits and correction memory (not model fine-tuning).

@@ -70,7 +70,7 @@ async function main() {
   const args = parseArgs(process.argv);
   const inputRoot = path.resolve(args.input || "./patients");
   const outputRoot = path.resolve(args.output || "./runs/latest");
-  const maxSteps = Number(args.maxSteps || 20);
+  const maxSteps = Number(args.maxSteps || 35);
 
   await ensureDir(outputRoot);
   const patientJobs = await buildPatientJobs(inputRoot);

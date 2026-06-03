@@ -3,17 +3,11 @@ const {
   readPdfText,
   listPatientPdfFiles
 } = require("./pdf");
+const { buildIndex } = require("./retrieval");
+const { extractWithRag, hasExtractedValue } = require("./ragExtract");
 const {
-  extractDemographics,
   extractDates,
-  extractDiagnoses,
-  extractProcedures,
-  extractAllergies,
-  extractMedicationSections,
-  extractHospitalCourse,
-  extractFollowUp,
-  extractPendingResults,
-  extractDischargeCondition
+  extractDiagnoses
 } = require("./extractors");
 const {
   withRetries,
@@ -26,7 +20,7 @@ function mkMissing(reason = "Missing from source notes") {
   return { status: "missing", reason };
 }
 
-function toKnown(value, sourceHint = null) {
+function toKnown(value, sourceHint = null, evidence = []) {
   if (value == null) return mkMissing();
   if (Array.isArray(value) && value.length === 0) return mkMissing();
   if (typeof value === "object" && !Array.isArray(value)) {
@@ -36,7 +30,9 @@ function toKnown(value, sourceHint = null) {
     });
     if (!hasAnyTruthy) return mkMissing();
   }
-  return { status: "known", value, sourceHint };
+  const out = { status: "known", value, sourceHint: sourceHint || "rag" };
+  if (evidence?.length) out.evidence = evidence;
+  return out;
 }
 
 function initialDraft(patientId) {
@@ -63,8 +59,8 @@ function mergeUnique(current, incoming) {
   return [...set];
 }
 
-function detectConflicts(extractions) {
-  const conflicts = [];
+function detectConflicts(extractions, evidenceConflicts = []) {
+  const conflicts = [...evidenceConflicts];
 
   const principal = mergeUnique([], extractions.diagnoses.principal || []);
   if (principal.length > 1) {
@@ -84,7 +80,13 @@ function detectConflicts(extractions) {
     });
   }
 
-  return conflicts;
+  const seen = new Set();
+  return conflicts.filter((c) => {
+    const key = `${c.field}:${JSON.stringify(c.values)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function buildReasoning(state) {
@@ -93,26 +95,36 @@ function buildReasoning(state) {
     .filter(([k, v]) => k !== "review_flags" && v?.status === "missing")
     .map(([k]) => k);
 
+  if (!state.ragBuilt) return "Index source-note chunks for evidence retrieval (RAG)";
   if (missing.length) {
-    return `Fill unresolved sections: ${missing.join(", ")}`;
+    return `Retrieve evidence and fill unresolved sections: ${missing.join(", ")}`;
   }
   if (!state.interactionChecked) return "Safety check medications for potential interactions";
   if (state.conflicts.length) return "Escalate unresolved conflicts for clinician review";
   return "Finalize draft output";
 }
 
+function needsExtraction(state, fieldKey, draftKey = fieldKey) {
+  return state.draft[draftKey]?.status === "missing" && !state.fieldAttempts[fieldKey];
+}
+
+function markAttempted(state, fieldKey) {
+  state.fieldAttempts[fieldKey] = true;
+}
+
 function planNextAction(state) {
   if (!state.loadedDocs) return "load_documents";
-  if (state.draft.demographics.status === "missing") return "extract_demographics";
-  if (state.draft.admission_discharge_dates.status === "missing") return "extract_dates";
-  if (state.draft.principal_diagnoses.status === "missing") return "extract_diagnoses";
-  if (state.draft.hospital_course.status === "missing") return "extract_hospital_course";
-  if (state.draft.procedures.status === "missing") return "extract_procedures";
-  if (state.draft.discharge_medications.status === "missing") return "extract_medications";
-  if (state.draft.allergies.status === "missing") return "extract_allergies";
-  if (state.draft.follow_up_instructions.status === "missing") return "extract_followup";
-  if (state.draft.pending_results.status === "missing") return "extract_pending";
-  if (state.draft.discharge_condition.status === "missing") return "extract_discharge_condition";
+  if (!state.ragBuilt) return "build_rag_index";
+  if (needsExtraction(state, "demographics")) return "extract_demographics";
+  if (needsExtraction(state, "admission_discharge_dates", "admission_discharge_dates")) return "extract_dates";
+  if (needsExtraction(state, "principal_diagnoses")) return "extract_diagnoses";
+  if (needsExtraction(state, "hospital_course")) return "extract_hospital_course";
+  if (needsExtraction(state, "procedures")) return "extract_procedures";
+  if (needsExtraction(state, "discharge_medications")) return "extract_medications";
+  if (needsExtraction(state, "allergies")) return "extract_allergies";
+  if (needsExtraction(state, "follow_up_instructions")) return "extract_followup";
+  if (needsExtraction(state, "pending_results")) return "extract_pending";
+  if (needsExtraction(state, "discharge_condition")) return "extract_discharge_condition";
   if (!state.conflictsEvaluated) return "detect_conflicts";
   if (!state.interactionChecked) return "check_interactions";
   if (state.conflicts.length && !state.conflictsEscalated) return "escalate_conflicts";
@@ -121,6 +133,15 @@ function planNextAction(state) {
 
 function addTrace(state, step) {
   state.trace.push(step);
+}
+
+function combinedText(state) {
+  return state.documents.map((d) => d.text).join("\n\n");
+}
+
+function recordEvidenceConflict(state, conflict) {
+  if (!conflict) return;
+  state.evidenceConflicts.push(conflict);
 }
 
 async function actionLoadDocuments(state) {
@@ -137,7 +158,13 @@ async function actionLoadDocuments(state) {
       fn: ({ file: fp }) => readPdfText(fp)
     });
     if (result.ok) {
-      parsedDocs.push({ file, text: result.result });
+      const payload = result.result;
+      const text = typeof payload === "string" ? payload : payload.text;
+      const extraction =
+        typeof payload === "object" && payload
+          ? { method: payload.method, totalPages: payload.totalPages }
+          : { method: "unknown" };
+      parsedDocs.push({ file, text, extraction });
     } else {
       failures.push({ file, error: result.error });
     }
@@ -145,6 +172,15 @@ async function actionLoadDocuments(state) {
 
   state.documents = parsedDocs;
   state.loadedDocs = true;
+
+  if (parsedDocs.some((d) => d.extraction?.method === "ocr")) {
+    state.draft.review_flags.push({
+      severity: "medium",
+      type: "ocr_ingestion",
+      message:
+        "Source PDF was processed with OCR; extracted values may contain recognition errors and require clinician verification."
+    });
+  }
 
   if (!parsedDocs.length) {
     state.draft.review_flags.push({
@@ -162,62 +198,135 @@ async function actionLoadDocuments(state) {
     });
   }
 
-  return { loaded_count: parsedDocs.length, failures };
+  return {
+    loaded_count: parsedDocs.length,
+    failures,
+    extractions: parsedDocs.map((d) => ({
+      file: path.basename(d.file),
+      method: d.extraction?.method,
+      pages: d.extraction?.totalPages,
+      chars: d.text?.length || 0
+    }))
+  };
 }
 
-function combinedText(state) {
-  return state.documents.map((d) => d.text).join("\n\n");
+function actionBuildRagIndex(state) {
+  state.ragIndex = buildIndex(state.documents);
+  state.ragBuilt = true;
+  return {
+    chunk_count: state.ragIndex.chunkCount,
+    message: "RAG index built from patient source notes only (no external knowledge)."
+  };
 }
 
 async function executeAction(state, action) {
-  const text = combinedText(state);
+  const fallbackText = combinedText(state);
+
   switch (action) {
+    case "build_rag_index":
+      return actionBuildRagIndex(state);
     case "extract_demographics": {
-      const d = extractDemographics(text);
-      state.draft.demographics = toKnown(d, "all_documents");
-      return d;
+      const rag = extractWithRag(state.ragIndex, "demographics", fallbackText);
+      recordEvidenceConflict(state, rag.conflict);
+      state.draft.demographics = toKnown(rag.value, rag.usedFallback ? "full_document_fallback" : "rag", rag.evidence);
+      markAttempted(state, "demographics");
+      return rag;
     }
     case "extract_dates": {
+      const rag = extractWithRag(state.ragIndex, "admission_discharge_dates", fallbackText);
+      recordEvidenceConflict(state, rag.conflict);
+
       const perDoc = state.documents.map((d) => extractDates(d.text));
-      const admissionDates = mergeUnique([], perDoc.map((d) => d.admission_date).filter(Boolean));
-      const dischargeDates = mergeUnique([], perDoc.map((d) => d.discharge_date).filter(Boolean));
+      const admissionDates = mergeUnique(
+        [],
+        [rag.value?.admission_date, ...perDoc.map((d) => d.admission_date)].filter(Boolean)
+      );
+      const dischargeDates = mergeUnique(
+        [],
+        [rag.value?.discharge_date, ...perDoc.map((d) => d.discharge_date)].filter(Boolean)
+      );
       state.extractions.dates = { admission_date: admissionDates, discharge_date: dischargeDates };
       state.draft.admission_discharge_dates = toKnown(
         {
           admission_date: admissionDates[0] || null,
           discharge_date: dischargeDates[0] || null
         },
-        "multiple_documents"
+        rag.usedFallback ? "full_document_fallback" : "rag",
+        rag.evidence
       );
-      return state.extractions.dates;
+      markAttempted(state, "admission_discharge_dates");
+      return { rag, dates: state.extractions.dates };
     }
     case "extract_diagnoses": {
+      const principalRag = extractWithRag(state.ragIndex, "principal_diagnoses", fallbackText);
+      const secondaryRag = extractWithRag(state.ragIndex, "secondary_diagnoses", fallbackText);
+      recordEvidenceConflict(state, principalRag.conflict);
+      recordEvidenceConflict(state, secondaryRag.conflict);
+
       const diagnoses = state.documents.map((d) => extractDiagnoses(d.text));
-      const principal = mergeUnique([], diagnoses.flatMap((d) => d.principal || []));
-      const secondary = mergeUnique([], diagnoses.flatMap((d) => d.secondary || []));
+      const principal = mergeUnique(
+        [],
+        [...(principalRag.value || []), ...diagnoses.flatMap((d) => d.principal || [])]
+      );
+      const secondary = mergeUnique(
+        [],
+        [...(secondaryRag.value || []), ...diagnoses.flatMap((d) => d.secondary || [])]
+      );
       state.extractions.diagnoses = { principal, secondary };
-      state.draft.principal_diagnoses = toKnown(principal, "multiple_documents");
-      state.draft.secondary_diagnoses = toKnown(secondary, "multiple_documents");
+      state.draft.principal_diagnoses = toKnown(
+        principal,
+        principalRag.usedFallback ? "full_document_fallback" : "rag",
+        principalRag.evidence
+      );
+      state.draft.secondary_diagnoses = toKnown(
+        secondary,
+        secondaryRag.usedFallback ? "full_document_fallback" : "rag",
+        secondaryRag.evidence
+      );
+      markAttempted(state, "principal_diagnoses");
       return state.extractions.diagnoses;
     }
     case "extract_hospital_course": {
-      const course = extractHospitalCourse(text);
-      state.draft.hospital_course = toKnown(course, "all_documents");
-      return course;
+      const rag = extractWithRag(state.ragIndex, "hospital_course", fallbackText);
+      recordEvidenceConflict(state, rag.conflict);
+      state.draft.hospital_course = toKnown(
+        rag.value,
+        rag.usedFallback ? "full_document_fallback" : "rag",
+        rag.evidence
+      );
+      markAttempted(state, "hospital_course");
+      return rag;
     }
     case "extract_procedures": {
-      const procedures = mergeUnique([], state.documents.flatMap((d) => extractProcedures(d.text)));
-      state.draft.procedures = toKnown(procedures, "multiple_documents");
-      return procedures;
+      const rag = extractWithRag(state.ragIndex, "procedures", fallbackText);
+      recordEvidenceConflict(state, rag.conflict);
+      state.draft.procedures = toKnown(
+        rag.value,
+        rag.usedFallback ? "full_document_fallback" : "rag",
+        rag.evidence
+      );
+      markAttempted(state, "procedures");
+      return rag;
     }
     case "extract_medications": {
-      const medSlices = state.documents.map((d) => extractMedicationSections(d.text));
-      const admissionMeds = mergeUnique([], medSlices.flatMap((m) => m.admission_meds || []));
-      const dischargeMeds = mergeUnique([], medSlices.flatMap((m) => m.discharge_meds || []));
+      const admissionRag = extractWithRag(state.ragIndex, "admission_medications", fallbackText);
+      const dischargeRag = extractWithRag(state.ragIndex, "discharge_medications", fallbackText);
+      recordEvidenceConflict(state, admissionRag.conflict);
+      recordEvidenceConflict(state, dischargeRag.conflict);
+
+      const admissionMeds = admissionRag.value || [];
+      const dischargeMeds = dischargeRag.value || [];
       const reconciliation = reconcileMedications(admissionMeds, dischargeMeds);
       state.extractions.medications = { admissionMeds, dischargeMeds };
-      state.draft.discharge_medications = toKnown(dischargeMeds, "multiple_documents");
-      state.draft.medication_changes = toKnown(reconciliation, "calculated");
+      state.draft.discharge_medications = toKnown(
+        dischargeMeds,
+        dischargeRag.usedFallback ? "full_document_fallback" : "rag",
+        dischargeRag.evidence
+      );
+      state.draft.medication_changes = toKnown(reconciliation, "calculated", [
+        ...admissionRag.evidence.slice(0, 2),
+        ...dischargeRag.evidence.slice(0, 2)
+      ]);
 
       const undocumentedChanges = [
         ...reconciliation.added.map((m) => ({ kind: "added", medication: m })),
@@ -231,30 +340,50 @@ async function executeAction(state, action) {
           details: undocumentedChanges
         });
       }
-      return { dischargeMeds, reconciliation };
+      markAttempted(state, "discharge_medications");
+      return { admissionMeds, dischargeMeds, reconciliation };
     }
     case "extract_allergies": {
-      const allergies = mergeUnique([], state.documents.flatMap((d) => extractAllergies(d.text)));
-      state.draft.allergies = toKnown(allergies, "multiple_documents");
-      return allergies;
+      const rag = extractWithRag(state.ragIndex, "allergies", fallbackText);
+      recordEvidenceConflict(state, rag.conflict);
+      state.draft.allergies = toKnown(rag.value, rag.usedFallback ? "full_document_fallback" : "rag", rag.evidence);
+      markAttempted(state, "allergies");
+      return rag;
     }
     case "extract_followup": {
-      const f = extractFollowUp(text);
-      state.draft.follow_up_instructions = toKnown(f, "all_documents");
-      return f;
+      const rag = extractWithRag(state.ragIndex, "follow_up_instructions", fallbackText);
+      recordEvidenceConflict(state, rag.conflict);
+      state.draft.follow_up_instructions = toKnown(
+        rag.value,
+        rag.usedFallback ? "full_document_fallback" : "rag",
+        rag.evidence
+      );
+      markAttempted(state, "follow_up_instructions");
+      return rag;
     }
     case "extract_pending": {
-      const pending = mergeUnique([], state.documents.flatMap((d) => extractPendingResults(d.text)));
-      state.draft.pending_results = toKnown(pending, "multiple_documents");
-      return pending;
+      const rag = extractWithRag(state.ragIndex, "pending_results", fallbackText);
+      recordEvidenceConflict(state, rag.conflict);
+      const pending = hasExtractedValue(rag.value) ? rag.value : null;
+      state.draft.pending_results = pending
+        ? toKnown(pending, rag.usedFallback ? "full_document_fallback" : "rag", rag.evidence)
+        : mkMissing("No pending results documented");
+      markAttempted(state, "pending_results");
+      return rag;
     }
     case "extract_discharge_condition": {
-      const cond = extractDischargeCondition(text);
-      state.draft.discharge_condition = toKnown(cond, "all_documents");
-      return cond;
+      const rag = extractWithRag(state.ragIndex, "discharge_condition", fallbackText);
+      recordEvidenceConflict(state, rag.conflict);
+      state.draft.discharge_condition = toKnown(
+        rag.value,
+        rag.usedFallback ? "full_document_fallback" : "rag",
+        rag.evidence
+      );
+      markAttempted(state, "discharge_condition");
+      return rag;
     }
     case "detect_conflicts": {
-      state.conflicts = detectConflicts(state.extractions);
+      state.conflicts = detectConflicts(state.extractions, state.evidenceConflicts);
       state.conflictsEvaluated = true;
       for (const conflict of state.conflicts) {
         state.draft.review_flags.push({
@@ -313,13 +442,17 @@ async function executeAction(state, action) {
   }
 }
 
-async function runDischargeSummaryAgent({ patientId, patientDir, patientPdfFiles = null, maxSteps = 20 }) {
+async function runDischargeSummaryAgent({ patientId, patientDir, patientPdfFiles = null, maxSteps = 35 }) {
   const state = {
     patientId,
     patientDir,
     patientPdfFiles,
     documents: [],
     loadedDocs: false,
+    ragBuilt: false,
+    ragIndex: null,
+    fieldAttempts: {},
+    evidenceConflicts: [],
     conflictsEvaluated: false,
     interactionChecked: false,
     conflictsEscalated: false,
@@ -340,7 +473,9 @@ async function runDischargeSummaryAgent({ patientId, patientDir, patientPdfFiles
       missing_fields: Object.entries(state.draft)
         .filter(([k, v]) => k !== "review_flags" && v?.status === "missing")
         .map(([k]) => k),
-      conflicts_open: state.conflicts.length
+      conflicts_open: state.conflicts.length,
+      rag_ready: state.ragBuilt,
+      rag_chunks: state.ragIndex?.chunkCount || 0
     };
     let output;
     let error = null;
