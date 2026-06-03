@@ -1,192 +1,157 @@
 # Discharge Summary Agent
 
-This project implements an **agentic discharge-summary drafting system** for synthetic patient PDFs.
-It is designed for clinician review workflows and enforces a strict **no-fabrication** policy.
+Agentic AI system that ingests synthetic patient source-note PDFs and produces **structured discharge-summary drafts for clinician review**. Built for a take-home assignment with a strict **no-fabrication** policy.
 
-## What is implemented
+**Docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [SUBMISSION.md](./SUBMISSION.md)
 
-### Part 1 (required): completed
+---
 
-- Real iterative agent loop with planning + re-planning (`runDischargeSummaryAgent` in `src/agent.js`)
-- **RAG evidence retrieval** over ingested source notes only (`src/retrieval.js`, `src/ragExtract.js`)
-- PDF ingestion from patient folders (`src/pdf.js`)
-- Structured discharge-summary draft output with required sections
-- No fabrication guardrail:
-  - Missing fields are emitted as `{ status: "missing", reason: ... }`
-  - Unknown values are never guessed
-- Pending/missing data surfaced explicitly
-- Medication reconciliation:
-  - compares admission vs discharge meds
-  - flags add/stop changes for clinician reconciliation if no reason documented
-- Conflict handling:
-  - detects conflicting principal diagnoses and discharge dates
-  - flags for clinician review, does not auto-resolve
-- Tool use with agent-decided timing:
-  - mock drug interaction lookup
-  - mock clinician escalation tool
-- Robust failure handling:
-  - retries on PDF/tool failures
-  - emits review flags instead of crashing
-- Hard control cap (`maxSteps`, default 20)
-- Observability:
-  - step trace includes reasoning -> action -> input -> result/error -> next
+## Quick start
 
-### Part 2 (stretch): included as a lightweight demonstrator
-
-- Simulated reviewer with hidden edit policy (`simulatedReviewerPolicy` in `src/learning.js`)
-- Reward definition:
-  - `reward = 1 - normalized_edit_distance(draft, edited)`
-- Learning mechanism:
-  - correction-memory rules learned over epochs and injected into future drafts
-- Before/after measurable metric:
-  - outputs improvement curve in `learning_report.json`
-
-## Project structure
-
-- `src/index.js` - CLI runner for Part 1 batch execution
-- `src/agent.js` - core agent loop and planning/actions
-- `src/retrieval.js` - chunking + lexical retrieval index (case PDFs only)
-- `src/ragExtract.js` - evidence-backed field extraction from retrieved chunks
-- `src/pdf.js` - PDF listing and extraction with timeout handling
-- `src/extractors.js` - section extraction helpers
-- `src/tools.js` - mock tools + retry wrapper + med reconciliation
-- `src/learning.js` - stretch learning loop
-- `src/learn_cli.js` - CLI runner for stretch loop
-
-## Input format
-
-Place patient data like:
-
-```text
-patients/
-  patient_001/
-    admission_note.pdf
-    progress_note_1.pdf
-    labs.pdf
-    med_rec.pdf
-  patient_002/
-    ...
-```
-
-Recommended (workspace-local) setup:
-
-```text
-input/
-  patient_sources/
-    patient_001.pdf
-    patient_002.pdf
-```
-
-Keep your source PDFs inside this workspace so runs are reproducible and portable.
-
-The runner also supports:
-
-- A **single PDF file** (one patient)
-- A **single folder containing PDFs** (one patient)
-- A **folder of patient subfolders** (multi-patient batch)
-
-## Run instructions
-
-1. Install dependencies:
-
-```bash
+```powershell
 npm install
-```
-
-2. Run Part 1 agent:
-
-```bash
-npm start -- --input ./patients --output ./runs/latest --maxSteps 20
-```
-
-Workspace-local single file:
-
-```bash
-npm start -- --input "./input/patient_sources/patient_001.pdf" --output ./runs/latest --maxSteps 20
-```
-
-Workspace-local folder of PDFs:
-
-```bash
-npm start -- --input "./input/patient_sources" --output ./runs/latest --maxSteps 20
-```
-
-Single-file mode example (Windows path with spaces):
-
-```bash
-npm start -- --input "C:\Users\Aryan\Downloads\patient 2 (1).pdf" --output ./runs/latest --maxSteps 20
-```
-
-3. (Optional) Run Part 2 learning loop on generated drafts:
-
-```bash
+npm start -- --input "./input/patient_sources" --output ./runs/latest --maxSteps 35
 npm run learn -- --drafts ./runs/latest --out ./runs/latest/learning_report.json
 ```
 
-## Outputs
+**Input modes:** single PDF · folder of PDFs · folder of patient subfolders  
+**Outputs:** `discharge_summary_draft.json`, `trace.json`, `run_summary.json` per run
 
-For each patient:
+---
 
-- `runs/<run_name>/<patient_id>/discharge_summary_draft.json`
-- `runs/<run_name>/<patient_id>/trace.json`
+## Agent loop design
 
-Run-level:
+The core loop in `src/agent.js` is **from-scratch** (no LangGraph/CrewAI):
 
-- `runs/<run_name>/run_summary.json`
+1. **Plan** — inspect state: missing fields, RAG index readiness, conflicts, safety checks
+2. **Act** — execute one action (ingest, index, extract, tool call, finalize)
+3. **Observe** — log reasoning → action → input → result/error → next in `trace.json`
+4. **Re-plan** — repeat until `finalize` or hard step cap (`maxSteps`, default 35)
 
-Optional Part 2:
+Typical action flow:
 
-- `runs/<run_name>/learning_report.json`
+```
+load_documents → build_rag_index → extract_* (per field) → detect_conflicts
+→ check_interactions → escalate_conflicts → finalize
+```
 
-## Safety notes
+Each field is attempted once per run. If evidence is insufficient, the field stays `missing` and the agent moves on — it does not guess.
 
-- This is a drafting assistant only; no auto-finalized clinical document.
-- Missing, pending, and conflicting facts are always escalated/flagged.
-- Drug interaction and escalation tools are mocked and can be replaced with production integrations.
+---
+
+## No-fabrication guardrail
+
+- All draft fields start as `{ status: "missing" }`
+- Values become `{ status: "known", value, evidence?, sourceHint }` only when extractors find support in source text
+- No LLM is used to invent clinical facts
+- Pending results default to missing unless explicitly documented
+- OCR-processed PDFs get a `review_flags` entry (`ocr_ingestion`)
+- Output is always a **draft for review**, never auto-finalized
+
+---
 
 ## PDF ingestion (text + scanned)
 
-The project uses a **two-stage strategy**:
+Two-stage pipeline in `src/pdf.js`:
 
-1. **Fast text-layer extraction** with `unpdf` (PDF.js-based).
-2. **OCR fallback** for scanned/image PDFs when extracted text is too sparse:
-   - `unpdf` `extractImages` pulls embedded page images
-   - `sharp` converts raw pixels to PNG
-   - `tesseract.js` performs OCR per page
+1. **Text layer** — `unpdf` (PDF.js) for searchable PDFs
+2. **OCR fallback** — when text is sparse: `extractImages` → `sharp` → `tesseract.js` per page
 
-### Why not `pdf-text-extract`?
+Pages are tagged `--- page N ---` for RAG chunking. OCR on large scans can take several minutes.
 
-`pdf-text-extract` wraps Poppler `pdftotext` and is strong for searchable PDFs on Linux servers, but:
+---
 
-- it still does **not OCR scanned pages** by itself
-- it requires external Poppler binaries (extra setup on Windows/serverless)
-- your current patient PDF is image-based, so OCR fallback is required anyway
+## RAG evidence grounding
 
-For this assignment and Windows-local workflow, **`unpdf + OCR fallback` is the better fit**.
+After ingest, the agent builds a **local retrieval index** over patient documents only (`src/retrieval.js`, `src/ragExtract.js`):
 
-Run locally:
+1. Chunk text (page-aware, overlapping windows)
+2. Retrieve top evidence per discharge field via lexical queries
+3. Extract values from retrieved context only
+4. Attach `evidence` snippets (file, page, score) to known fields
+5. Flag conflicts when retrieved evidence disagrees
 
-```bash
-npm start -- --input "./input/patient_sources/patient 2 (1).pdf" --output ./runs/latest --maxSteps 20
+No external medical knowledge is injected.
+
+---
+
+## Failure and conflict handling
+
+| Situation | Response |
+|---|---|
+| PDF read failure / timeout | Retry (×2), then `review_flags` ingestion failure |
+| Tool failure | Flagged, loop continues |
+| Runtime error on action | Flagged, loop continues |
+| Conflicting diagnoses/dates | Flagged, not auto-resolved; escalation tool called |
+| Evidence disagreement | Added to conflict set |
+| Med added/stopped without reason | `medication_reconciliation` flag |
+| Step cap reached | `step_cap_reached` flag, graceful stop |
+
+Mock tools in `src/tools.js`: drug interaction lookup, clinician escalation, medication reconciliation.
+
+---
+
+## Part 2 — learning from simulated edits (stretch)
+
+`src/learning.js` implements a lightweight feedback loop:
+
+- **Simulated reviewer** applies hidden edit policies (safety language, med formatting, pending-results reminder)
+- **Reward:** `1 - normalized_edit_distance(draft, edited)`
+- **Learning:** correction-memory rules applied across epochs
+- **Output:** `learning_report.json` with before/after metrics and improvement curve
+
+This is a demonstrator — not production fine-tuning. Part 1 safety rules are not overridden.
+
+---
+
+## Project structure
+
+| File | Role |
+|---|---|
+| `src/index.js` | CLI batch runner |
+| `src/agent.js` | Agent loop, planning, actions, trace |
+| `src/pdf.js` | PDF + OCR ingestion |
+| `src/retrieval.js` | Chunking, lexical RAG index |
+| `src/ragExtract.js` | Evidence-backed field extraction |
+| `src/extractors.js` | Section regex parsers |
+| `src/tools.js` | Retries, mock tools, med reconciliation |
+| `src/learning.js` | Part 2 simulated learning |
+| `src/learn_cli.js` | Part 2 CLI |
+
+---
+
+## Input layout
+
+```text
+input/patient_sources/
+  patient_001.pdf
+  patient_002.pdf
 ```
 
-Note: OCR can take several minutes for multi-page scans.
+---
 
-## RAG workflow (agentic evidence grounding)
+## Limitations
 
-After PDF ingest, the agent:
+- Regex extractors struggle on noisy OCR output
+- Single PDF may contain multiple patient records (evidence can mix)
+- Conflict detection covers key fields, not all clinical dimensions
+- Tools are mocked, not production APIs
+- RAG is lexical (no embeddings yet)
+- Part 2 uses simulated reviewer, not real clinician edits
 
-1. Chunks each patient's source text (page-aware, overlap windows)
-2. Builds a local lexical retrieval index (no external medical knowledge)
-3. For each discharge field, retrieves top evidence chunks via field-specific queries
-4. Extracts values only from retrieved context (+ full-document fallback if no evidence)
-5. Attaches `evidence` snippets to known fields in `discharge_summary_draft.json`
-6. Flags conflicts when retrieved evidence disagrees
+---
 
-Safety rule preserved: if evidence is insufficient, field remains `missing` (never guessed).
+## With more time
 
-## Limits and next improvements
+1. Patient-of-record filter before RAG indexing
+2. Embedding-based retrieval (still case-only, no external facts)
+3. Layout-aware / hospital-format-specific extractors
+4. Real drug-interaction API integration
+5. Citation-enforced LLM synthesis over retrieved chunks only
+6. Part 2 with real edit logs and anti-gaming reward metrics
 
-- Extraction uses regex heuristics and can be improved with section classifiers on top of OCR text.
-- Conflict detection currently targets common high-risk conflicts; can be expanded.
-- Part 2 uses simulated edits and correction memory (not model fine-tuning).
+---
+
+## License / data
+
+Synthetic patient data only. Do not commit real PHI. API keys are not required for the current implementation.
