@@ -3,3 +3,4 @@ runs/
 *.log
 .env
 .env.*
+eng.traineddata

@@ -6,8 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
-    "run:demo": "node src/index.js --input ./sample-data --output ./runs/demo",
-    "learn": "node src/learn_cli.js --drafts ./runs/demo --out ./runs/demo/learning_report.json"
+    "run:submission": "node src/index.js --input ./input/patient_sources --output ./runs/submission --maxSteps 35",
+    "learn": "node src/learn_cli.js --drafts ./runs/submission --out ./runs/submission/learning_report.json"
   },
   "dependencies": {
     "sharp": "^0.34.5",
