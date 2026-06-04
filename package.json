@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/index.js",
     "run:submission": "node src/index.js --input ./input/patient_sources --output ./runs/submission --maxSteps 35",
-    "learn": "node src/learn_cli.js --drafts ./runs/submission --out ./runs/submission/learning_report.json"
+    "learn": "node src/learn_cli.js --drafts ./runs/latest --out ./runs/latest/learning_report.json"
   },
   "dependencies": {
     "sharp": "^0.34.5",

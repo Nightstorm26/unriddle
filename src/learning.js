@@ -11,26 +11,69 @@ function textify(v) {
   return JSON.stringify(v);
 }
 
+// function levenshtein(a, b) {
+//   const m = a.length;
+//   const n = b.length;
+//   const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+//   for (let i = 0; i <= m; i += 1) dp[i][0] = i;
+//   for (let j = 0; j <= n; j += 1) dp[0][j] = j;
+//   for (let i = 1; i <= m; i += 1) {
+//     for (let j = 1; j <= n; j += 1) {
+//       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+//       dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+//     }
+//   }
+//   return dp[m][n];
+// }
 function levenshtein(a, b) {
+  // Guard: if either string is huge, use a length-based approximation
+  const MAX_LEN = 100_000;
+  if (a.length > MAX_LEN || b.length > MAX_LEN) {
+    return Math.abs(a.length - b.length);
+  }
+
   const m = a.length;
   const n = b.length;
-  const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i += 1) dp[i][0] = i;
-  for (let j = 0; j <= n; j += 1) dp[0][j] = j;
+
+  // Only keep two rows instead of the full m×n matrix
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  let curr = new Array(n + 1);
+
   for (let i = 1; i <= m; i += 1) {
+    curr[0] = i;
     for (let j = 1; j <= n; j += 1) {
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
     }
+    [prev, curr] = [curr, prev]; // swap rows
   }
-  return dp[m][n];
+
+  return prev[n];
 }
 
+// function normalizedEditDistance(a, b) {
+//   const aa = textify(a);
+//   const bb = textify(b);
+//   const denom = Math.max(aa.length, bb.length, 1);
+//   return levenshtein(aa, bb) / denom;
+// }
 function normalizedEditDistance(a, b) {
-  const aa = textify(a);
-  const bb = textify(b);
-  const denom = Math.max(aa.length, bb.length, 1);
-  return levenshtein(aa, bb) / denom;
+  const keysA = Object.keys(a);
+  const keysB = new Set(Object.keys(b));
+  const allKeys = [...new Set([...keysA, ...Object.keys(b)])];
+
+  let totalDist = 0;
+  let totalLen = 0;
+
+  for (const key of allKeys) {
+    const aa = textify(a[key]);
+    const bb = textify(b[key]);
+    const denom = Math.max(aa.length, bb.length, 1);
+    totalDist += levenshtein(aa, bb);
+    totalLen += denom;
+  }
+
+  return totalLen === 0 ? 0 : totalDist / totalLen;
 }
 
 function simulatedReviewerPolicy(draft) {
